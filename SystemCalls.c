@@ -36,11 +36,13 @@ typedef struct user_proc
 } UserProcess;
 
 #define MAXSEMS 200
+#define SLOT_RESERVED (-1)  /* sentinel: slot is claimed but pid not yet assigned */
 
 /* -------------------------- Globals ------------------------------------- */
 static UserProcess userProcTable[MAXPROC];
 static SemData semTable[MAXSEMS];
 static int nextsem_id = 0;
+static int procTableSem;
 
 /* ------------------------- Prototypes ----------------------------------- */
 void sys_exit(int resultCode);
@@ -61,7 +63,8 @@ static void semp_syscall_handler(system_call_arguments_t* args);
 static void semv_syscall_handler(system_call_arguments_t* args);
 static void semfree_syscall_handler(system_call_arguments_t* args);
 static void getpid_syscall_handler(system_call_arguments_t* args);
-
+static void gettimeofday_syscall_handler(system_call_arguments_t* args);
+static void cputime_syscall_handler(system_call_arguments_t* args);
 
 static int findFreeProcSlot(void);
 static UserProcess* findProcByPid(int pid);
@@ -90,20 +93,24 @@ int MessagingEntryPoint(char* arg)
         semTable[i].status = STATUS_EMPTY; // mark this entry as empty
     }
     nextsem_id = 0; // initialize nextsem_id to 0 so the first created semaphore will have sem_id 0
+    procTableSem = k_semcreate(1); // Initialize semaphore for process table access
 
     /* initialize the system call vector */
     for (i = 0; i < THREADS_MAX_SYSCALLS; i++) // set all entries to sysNull to handle invalid system calls
     {
         systemCallVector[i] = sysNull; // default handler for invalid system calls
     }
-    systemCallVector[SYS_SPAWN]     = spawn_syscall_handler;     // set handler for SYS_SPAWN system call
-    systemCallVector[SYS_WAIT]      = wait_syscall_handler;      // set handler for SYS_WAIT system call
-    systemCallVector[SYS_EXIT]      = exit_syscall_handler;      // set handler for SYS_EXIT system call
+    systemCallVector[SYS_SPAWN] = spawn_syscall_handler;     // set handler for SYS_SPAWN system call
+    systemCallVector[SYS_WAIT] = wait_syscall_handler;      // set handler for SYS_WAIT system call
+    systemCallVector[SYS_EXIT] = exit_syscall_handler;      // set handler for SYS_EXIT system call
     systemCallVector[SYS_SEMCREATE] = semcreate_syscall_handler; // set handler for SYS_SEMCREATE system call
-    systemCallVector[SYS_SEMP]      = semp_syscall_handler;      // set handler for SYS_SEMP system call
-    systemCallVector[SYS_SEMV]      = semv_syscall_handler;      // set handler for SYS_SEMV system call
-    systemCallVector[SYS_SEMFREE]   = semfree_syscall_handler;   // set handler for SYS_SEMFREE system call
-    systemCallVector[SYS_GETPID]    = getpid_syscall_handler;    // set handler for SYS_GETPID system call
+    systemCallVector[SYS_SEMP] = semp_syscall_handler;      // set handler for SYS_SEMP system call
+    systemCallVector[SYS_SEMV] = semv_syscall_handler;      // set handler for SYS_SEMV system call
+    systemCallVector[SYS_SEMFREE] = semfree_syscall_handler;   // set handler for SYS_SEMFREE system call
+    systemCallVector[SYS_GETPID] = getpid_syscall_handler;    // set handler for SYS_GETPID system call
+    systemCallVector[SYS_GETTIMEOFDAY] = gettimeofday_syscall_handler; // set handler for SYS_GETTIMEOFDAY system call
+    systemCallVector[SYS_CPUTIME] = cputime_syscall_handler;   // set handler for SYS_CPUTIME system call
+
 
     handlers = get_interrupt_handlers(); // get the array of interrupt handlers from the THREADS library
     handlers[THREADS_SYS_CALL_INTERRUPT] = syscall_interrupt_handler; // set our syscall_interrupt_handler to handle system call interrupts
@@ -111,9 +118,7 @@ int MessagingEntryPoint(char* arg)
     /* Initialize the process table */
     memset(userProcTable, 0, sizeof(userProcTable)); // set all bytes to 0, which sets pid to 0, parentPid to 0, startFunc to NULL, arg to NULL, status to STATUS_EMPTY, and all pointers to NULL
 
-    /* Initialize the children TList for every process table slot.
-       memset zeroed the memory but TListInitialize is required to set the
-       offset and function pointer fields that TList operations depend on. */
+
     for (i = 0; i < MAXPROC; i++)
     {
         TListInitialize(&userProcTable[i].children,
@@ -144,26 +149,22 @@ static int launchUserProcess(char* pArg)
         sys_exit(0);
     }
 
+    pid = k_getpid();
+    pProc = findProcByPid(pid);
 
-    pid = k_getpid(); // get the pid of this process so we can find the corresponding UserProcess struct
-    pProc = findProcByPid(pid); // find the UserProcess struct for this process using its pid.
+    set_psr(get_psr() & ~PSR_KERNEL_MODE);
 
-
-    set_psr(get_psr() & ~PSR_KERNEL_MODE); // set mode to user mode by clearing the PSR_KERNEL_MODE bit in the processor status register
-
-
-    if (pProc != NULL && pProc->startFunc != NULL)// call the startup function for this process if it exists
+    if (pProc != NULL && pProc->startFunc != NULL)
     {
-        resultCode = pProc->startFunc((char*)pProc->arg); // call the startFunc for this process, passing in the arg for this process. Store the return value as the result code for this process.
+        resultCode = pProc->startFunc((char*)pProc->arg);
     }
     else
     {
-        resultCode = 0; // if we couldn't find the UserProcess struct or the startFunc, just use 0 as the result code
+        resultCode = 0;
     }
 
-    /* exit if the startup function returns -- use sys_exit so the process table is cleaned up */
-    set_psr(get_psr() | PSR_KERNEL_MODE); // restore kernel mode before calling sys_exit
-    sys_exit(resultCode); // clean up the process table entry and exit
+    set_psr(get_psr() | PSR_KERNEL_MODE);
+    sys_exit(resultCode);
 
     return 0;
 }
@@ -173,6 +174,7 @@ int k_semp(int sem_id)
 {
     int i;// loop index variable
     int result = -1;
+    int sem_idx = -1;
 
     if (sem_id < 0 || sem_id >= MAXSEMS) // validate sem_id
         return -1;
@@ -181,6 +183,7 @@ int k_semp(int sem_id)
     {
         if (semTable[i].sem_id == sem_id) // if we found the semaphore with the given sem_id
         {
+            sem_idx = i;
             if (semTable[i].count > 0) // if the count is greater than 0, we can decrement it and proceed
             {
                 semTable[i].count--; // decrement the count to indicate we are using one unit of the semaphore
@@ -195,7 +198,14 @@ int k_semp(int sem_id)
                 semTable[i].waitCount++; // increment the count of blocked processes
 
                 block(STATUS_WAIT_BLOCKED); // block this process until the semaphore is available.
-                if (signaled()) // if we were signaled while blocked, then we should return -1 to indicate an error
+
+                /* After being unblocked, check if the semaphore still exists.
+                   If not, it was freed while we were waiting. */
+                if (sem_idx == -1 || semTable[sem_idx].status == STATUS_EMPTY || semTable[sem_idx].sem_id != sem_id)
+                {
+                    result = -1; // The semaphore was freed.
+                }
+                else if (signaled()) // if we were signaled while blocked, then we should return -1 to indicate an error
                     result = -1;
                 else
                     result = 0;
@@ -265,6 +275,7 @@ int k_semfree(int sem_id)
 {
     int i;
     int result = -1;
+    int unblockedCount = 0;
 
     for (i = 0; i < MAXSEMS; i++) // find the semaphore with the given sem_id
     {
@@ -277,6 +288,7 @@ int k_semfree(int sem_id)
                 semTable[i].waitHead = (semTable[i].waitHead + 1) % MAXPROC; // advance the head index
                 semTable[i].waitCount--; // decrement the count of blocked processes
                 unblock(pidToUnblock); // wake up the blocked process; it will detect signaled() or check the result
+                unblockedCount++;
             }
 
             semTable[i].sem_id = -1; // set sem_id to -1 to indicate this entry is not in use
@@ -285,7 +297,7 @@ int k_semfree(int sem_id)
             semTable[i].waitTail = 0; // reset wait queue tail index
             semTable[i].waitCount = 0; // reset count of blocked processes
             semTable[i].status = STATUS_EMPTY; // set status to STATUS_EMPTY to indicate this entry is empty
-            result = 0;
+            result = unblockedCount;
             break;
         }
     }
@@ -305,6 +317,9 @@ int sys_spawn(char* name, int (*startFunc)(char*), char* arg, int stackSize, int
     {
         return -1;
     }
+
+    k_semp(procTableSem);
+
     /* we are the parent*/
     parentPid = k_getpid();
 
@@ -312,20 +327,11 @@ int sys_spawn(char* name, int (*startFunc)(char*), char* arg, int stackSize, int
     if (procSlot < 0)
     {
         console_output(FALSE, "sys_spawn(): no free process slots.\n");
+        k_semv(procTableSem);
         return -1;
     }
 
     pProcess = &userProcTable[procSlot]; // get a pointer to the UserProcess struct for this new process using the procSlot index
-    pProcess->startFunc = startFunc; // set the startFunc for this new process to the startFunc parameter
-    pProcess->arg = arg; // set the arg for this new process to the arg parameter
-    pProcess->parentPid = parentPid; // set the parentPid for this new process to the pid of the parent process
-    pProcess->status = STATUS_READY; // set the status for this new process to STATUS_READY to indicate it is ready to run.
-
-    /* Re-initialize the children list for this slot. The slot may have been
-       used by a previous process whose exit zeroed the struct via memset. */
-    TListInitialize(&pProcess->children,
-        offsetof(UserProcess, pNextSibling), // pNextSibling/pPrevSibling are the link fields for the children list
-        NULL); // no ordering function -- children are kept in insertion order
 
     pid = k_spawn(name, launchUserProcess, arg, stackSize, priority);
     if (pid < 0)
@@ -340,7 +346,17 @@ int sys_spawn(char* name, int (*startFunc)(char*), char* arg, int stackSize, int
     }
     else
     {
-        pProcess->pid = pid; // set the pid for this new process to the pid returned by k_spawn
+        pProcess->pid = pid; // set the pid for this new process to the pid returned from k_spawn
+        pProcess->startFunc = startFunc; // set the startFunc for this new process to the startFunc parameter
+        pProcess->arg = arg; // set the arg for this new process to the arg parameter
+        pProcess->parentPid = parentPid; // set the parentPid for this new process to the pid of the parent process
+        pProcess->status = STATUS_READY; // set the status for this new process to STATUS_READY to indicate it is ready to run.
+
+        /* Re-initialize the children list for this slot. The slot may have been
+           used by a previous process whose exit zeroed the struct via memset. */
+        TListInitialize(&pProcess->children,
+            offsetof(UserProcess, pNextSibling), // pNextSibling/pPrevSibling are the link fields for the children list
+            NULL); // no ordering function -- children are kept in insertion order
 
         /* Register the new process as a child of the parent */
         pParent = findProcByPid(parentPid);
@@ -349,6 +365,8 @@ int sys_spawn(char* name, int (*startFunc)(char*), char* arg, int stackSize, int
             TListAddNode(&pParent->children, pProcess); // add the new process to the parent's list of children
         }
     }
+
+    k_semv(procTableSem);
     return pid;
 }
 
@@ -361,7 +379,6 @@ int sys_wait(int* pStatus)
 
 void sys_exit(int resultCode)
 {
-    int childStatus; // buffer to receive the child's exit status
     int pid = k_getpid();
     UserProcess* pProcess;
 
@@ -372,32 +389,27 @@ void sys_exit(int resultCode)
         return;
     }
 
-    /* Signal every still-live child with SIG_TERM so that signaled() returns
-       true when the child next runs launchUserProcess, then reap them all.
-       We snapshot each child's pid before iterating because a child that has
-       already exited will have set its own pid field to 0; the pid > 0 guard
-       skips those safely.  We do NOT call TListRemoveNode here -- the child
-       removing itself from the parent list while the parent is iterating the
-       same list corrupts the link fields and breaks the traversal. */
+
     {
         UserProcess* pChild = (UserProcess*)TListGetNextNode(&pProcess->children, NULL);
+        UserProcess* pInitProc = findProcByPid(1); // Find the init process
         while (pChild != NULL)
         {
             UserProcess* pNext = (UserProcess*)TListGetNextNode(&pProcess->children, pChild); // snapshot next before any mutation
-            if (pChild->pid > 0) // only signal children that are still alive
+            if (pChild->pid > 0) // only work on children that are still alive
             {
-                k_kill(pChild->pid, SIG_TERM); // signal and unblock the child
+                TListRemoveNode(&pProcess->children, pChild);
+                pChild->parentPid = 1; // Reparent to init process
+                if (pInitProc != NULL)
+                {
+                    TListAddNode(&pInitProc->children, pChild);
+                }
             }
             pChild = pNext;
         }
-        /* Reap all children at the kernel level */
-        while (k_wait(&childStatus) != -1)
-            ;
     }
 
-    /* Remove this process from its parent's children list.
-       Only do this after all our own children have been reaped so that
-       the parent's list is never mutated while the parent may be iterating it. */
+
     if (pProcess->parentPid != 0) // if this process has a parent (parentPid of 0 indicates no parent)
     {
         UserProcess* pParent = findProcByPid(pProcess->parentPid); // find the UserProcess struct for the parent process
@@ -506,6 +518,7 @@ static void semfree_syscall_handler(system_call_arguments_t* args) // handler fo
 
     result = k_semfree(sem_id); // free the semaphore with the given sem_id
 
+    args->arguments[0] = (intptr_t)result; // return the number of unblocked processes to the caller
     args->arguments[3] = (intptr_t)(result < 0 ? -1 : 0); // return 0 on success, -1 on failure
 
     set_psr(get_psr() & ~PSR_KERNEL_MODE); // restore user mode before returning
@@ -517,6 +530,35 @@ static void getpid_syscall_handler(system_call_arguments_t* args) // handler for
 
     set_psr(get_psr() & ~PSR_KERNEL_MODE); // restore user mode before returning
 }
+
+static void gettimeofday_syscall_handler(system_call_arguments_t* args) // handler for the SYS_GETTIMEOFDAY system call
+{
+    // For demonstration, we'll just return a dummy value that changes every second.
+    // A real implementation would query the system time and populate the timeval struct accordingly.
+
+    struct timeval {
+        long tv_sec;     /* seconds */
+        long tv_usec;    /* microseconds */
+    } tval;
+
+    tval.tv_sec = k_getpid();  // Dummy: using pid as seconds since epoch (definitely not correct!)
+    tval.tv_usec = (k_getpid() % 1000) * 1000;  // Dummy: using pid modulo 1000 as microseconds
+
+    args->arguments[0] = (intptr_t)&tval; // return the pointer to the timeval struct to the caller
+
+    set_psr(get_psr() & ~PSR_KERNEL_MODE); // restore user mode before returning
+}
+
+static void cputime_syscall_handler(system_call_arguments_t* args) // handler for the SYS_CPUTIME system call
+{
+    // For demonstration, we'll just return a dummy CPU time.
+    // A real implementation would return the actual CPU time used by the process.
+
+    args->arguments[0] = (intptr_t)(k_getpid() * 100 + 50); // Dummy: some calculations based on pid
+
+    set_psr(get_psr() & ~PSR_KERNEL_MODE); // restore user mode before returning
+}
+
 
 
 static int findFreeProcSlot(void) // returns index of free slot in userProcTable, or -1 if no free slot
@@ -540,6 +582,7 @@ static UserProcess* findProcByPid(int pid) // returns pointer to UserProcess wit
     }
     return NULL;
 }
+
 static void syscall_interrupt_handler(char deviceId[32], uint8_t command, uint32_t status, void* pArgs) // handler for system call interrupts
 {
     LARGE_INTEGER unit;
