@@ -9,6 +9,7 @@
 #include "SystemCalls.h"
 #include "libuser.h"
 
+
 /* -------------------- Typedefs and Structs ------------------------------- */
 typedef struct sem_data
 {
@@ -33,6 +34,7 @@ typedef struct user_proc
     int               parentPid; // pid of parent process, or 0 if no parent
     char* arg; // argument to pass to startFunc
     int               status; // STATUS_EMPTY, STATUS_RUNNING, STATUS_READY, STATUS_QUIT, STATUS_WAIT_BLOCKED, or STATUS_JOIN_BLOCKED
+    int               startTime; // time when this process started execution (in microseconds)
 
     int mboxStartup; // mailbox used to synchronize the start of this process after it is spawned
     int mboxWait; // mailbox used to block/wake this process when it is waiting for a child to finish or being waited on by a parent that is quitting
@@ -125,9 +127,10 @@ int MessagingEntryPoint(char* arg)
 
     for (i = 0; i < MAXPROC; i++)
     {
-        userProcTable[i].mboxStartup = mailbox_create(1, 0); // create a mailbox for this process to synchronize its startup after being spawned. This mailbox will be sent a message by sys_spawn after the process is created, and the new process will wait to receive that message before it starts executing its startFunc.
-        userProcTable[i].mboxMutex = mailbox_create(1, 0); // create a mailbox for this process to provide mutual exclusion when accessing this process's data (e.g. its children list). To acquire the mutex, a process will call mailbox_send to send a message to this mailbox, which will block if another process is currently holding the mutex. To release the mutex, a process will call mailbox_receive to receive the message from this mailbox, which will unblock one of the processes waiting to acquire the mutex if there are any.
-        userProcTable[i].mboxSem = mailbox_create(1, 0);  // create a mailbox for this process to block/wake on when it is blocked on a semaphore. This mailbox will be sent a message by the semp_syscall_handler when this process is blocked on a semaphore, and the semv_syscall_handler will send a message to this mailbox to wake this process up when the semaphore becomes available.
+        
+        userProcTable[i].mboxStartup = mailbox_create(1, 0); // create a mailbox for this process to synchronize its startup after being spawned. T
+        userProcTable[i].mboxMutex = mailbox_create(1, 0); // create a mailbox for this process to provide mutual exclusion when accessing this 
+        userProcTable[i].mboxSem = mailbox_create(1, 0);  // create a mailbox for this process to block/wake on when it is blocked on a semaphore. 
 
         TListInitialize(&userProcTable[i].children,
             offsetof(UserProcess, pNextSibling), // pNextSibling/pPrevSibling are the link fields for the children list
@@ -163,6 +166,9 @@ static int launchUserProcess(char* pArg)
     }
 
     set_psr(get_psr() & ~PSR_KERNEL_MODE);
+
+    // Record the start time for CPU time tracking
+    pProc->startTime = system_clock();
 
     /*launch the function*/
     if (pProc->startFunc != NULL)
@@ -530,7 +536,7 @@ static void semfree_syscall_handler(system_call_arguments_t* args) // handler fo
 
 	result = k_semfree(sem_id); // free the semaphore with the given sem_id
 
-    
+
 	args->arguments[0] = (intptr_t)result;// return the result code from k_semfree (1 if any waiters were released, 0 if no waiters were released, -1 on failure)
     args->arguments[3] = (intptr_t)result; 
 
@@ -552,9 +558,20 @@ static void gettimeofday_syscall_handler(system_call_arguments_t* args)
 
 static void cputime_syscall_handler(system_call_arguments_t* args) // handler for the SYS_CPUTIME system call
 {
-  
+    int pid;
+    UserProcess* pProc;
+    int cpu_time = 0;
+    
+    pid = k_getpid(); // get current process ID
+    pProc = findProcByPid(pid); // find the UserProcess struct for this process
+    
+    if (pProc != NULL)
+    {
+        // CPU time is the elapsed time since the process started
+        cpu_time = system_clock() - pProc->startTime;
+    }
 
-    args->arguments[0] = (intptr_t)(k_getpid() * 100 + 50); // Dummy: some calculations based on pid
+    args->arguments[0] = (intptr_t)cpu_time; // return the CPU time to the caller
 
     set_psr(get_psr() & ~PSR_KERNEL_MODE); // restore user mode before returning
 }
