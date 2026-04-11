@@ -33,6 +33,11 @@ typedef struct user_proc
     int               parentPid; // pid of parent process, or 0 if no parent
     char* arg; // argument to pass to startFunc
     int               status; // STATUS_EMPTY, STATUS_RUNNING, STATUS_READY, STATUS_QUIT, STATUS_WAIT_BLOCKED, or STATUS_JOIN_BLOCKED
+
+    int mboxStartup; // mailbox used to synchronize the start of this process after it is spawned
+    int mboxWait; // mailbox used to block/wake this process when it is waiting for a child to finish or being waited on by a parent that is quitting
+    int mboxSem; // mailbox used to block/wake this process when it is blocked on a semaphore
+    int mboxMutex; // mailbox used to provide mutual exclusion when accessing this process's data (e.g. its children list)
 } UserProcess;
 
 #define MAXSEMS 200
@@ -42,7 +47,7 @@ typedef struct user_proc
 static UserProcess userProcTable[MAXPROC];
 static SemData semTable[MAXSEMS];
 static int nextsem_id = 0;
-static int procTableSem;
+static int procTableMutex;
 
 /* ------------------------- Prototypes ----------------------------------- */
 void sys_exit(int resultCode);
@@ -93,7 +98,6 @@ int MessagingEntryPoint(char* arg)
         semTable[i].status = STATUS_EMPTY; // mark this entry as empty
     }
     nextsem_id = 0; // initialize nextsem_id to 0 so the first created semaphore will have sem_id 0
-    procTableSem = k_semcreate(1); // Initialize semaphore for process table access
 
     /* initialize the system call vector */
     for (i = 0; i < THREADS_MAX_SYSCALLS; i++) // set all entries to sysNull to handle invalid system calls
@@ -117,10 +121,14 @@ int MessagingEntryPoint(char* arg)
 
     /* Initialize the process table */
     memset(userProcTable, 0, sizeof(userProcTable)); // set all bytes to 0, which sets pid to 0, parentPid to 0, startFunc to NULL, arg to NULL, status to STATUS_EMPTY, and all pointers to NULL
-
+    procTableMutex = mailbox_create(1, 0); // 1-slot mailbox for mutual exclusion
 
     for (i = 0; i < MAXPROC; i++)
     {
+        userProcTable[i].mboxStartup = mailbox_create(1, 0); // create a mailbox for this process to synchronize its startup after being spawned. This mailbox will be sent a message by sys_spawn after the process is created, and the new process will wait to receive that message before it starts executing its startFunc.
+        userProcTable[i].mboxMutex = mailbox_create(1, 0); // create a mailbox for this process to provide mutual exclusion when accessing this process's data (e.g. its children list). To acquire the mutex, a process will call mailbox_send to send a message to this mailbox, which will block if another process is currently holding the mutex. To release the mutex, a process will call mailbox_receive to receive the message from this mailbox, which will unblock one of the processes waiting to acquire the mutex if there are any.
+        userProcTable[i].mboxSem = mailbox_create(1, 0);  // create a mailbox for this process to block/wake on when it is blocked on a semaphore. This mailbox will be sent a message by the semp_syscall_handler when this process is blocked on a semaphore, and the semv_syscall_handler will send a message to this mailbox to wake this process up when the semaphore becomes available.
+
         TListInitialize(&userProcTable[i].children,
             offsetof(UserProcess, pNextSibling), // pNextSibling/pPrevSibling are the link fields for the children list
             NULL); // no ordering function -- children are kept in insertion order
@@ -142,6 +150,11 @@ static int launchUserProcess(char* pArg)
     int resultCode;
     UserProcess* pProc;
 
+    pid = k_getpid();
+    pProc = &userProcTable[pid % MAXPROC]; // find the UserProcess struct for this process using the modulo strategy; this is safe because the parent process will not send the startup message until after it has filled out the PCB for this process, so we can be sure that the correct slot is filled out for this pid.
+    /* Wait for the startup message from sys_spawn before proceeding, to ensure that the PCB is fully set up before we start executing the user function. */
+    mailbox_receive(pProc->mboxStartup, NULL, 0, TRUE); // wait for a message on the mboxStartup mailbox, which will be sent by sys_spawn after the PCB for this process is fully set up. We can ignore the contents of the message and just use this as a synchronization point.
+
     /* if signaled when in the sys handler, then Exit */
     if (signaled())
     {
@@ -149,22 +162,20 @@ static int launchUserProcess(char* pArg)
         sys_exit(0);
     }
 
-    pid = k_getpid();
-    pProc = findProcByPid(pid);
-
     set_psr(get_psr() & ~PSR_KERNEL_MODE);
 
-    if (pProc != NULL && pProc->startFunc != NULL)
+    /*launch the function*/
+    if (pProc->startFunc != NULL)
     {
-        resultCode = pProc->startFunc((char*)pProc->arg);
+		resultCode = pProc->startFunc((char*)pProc->arg); // execute the startFunc for this process, passing the arg for this process as the argument to startFunc
     }
     else
     {
         resultCode = 0;
     }
 
-    set_psr(get_psr() | PSR_KERNEL_MODE);
-    sys_exit(resultCode);
+    set_psr(get_psr() | PSR_KERNEL_MODE); // return to kernel for exit
+	sys_exit(resultCode); // exit with the result code from startFunc
 
     return 0;
 }
@@ -172,43 +183,45 @@ static int launchUserProcess(char* pArg)
 
 int k_semp(int sem_id)
 {
-    int i;// loop index variable
-    int result = -1;
-    int sem_idx = -1;
+	int i; // loop index variable
+	int result = -1; // assume failure until we successfully acquire the semaphore
+	int sem_idx = -1; // index in the semaphore table of the target semaphore, set to -1 to indicate not found
 
-    if (sem_id < 0 || sem_id >= MAXSEMS) // validate sem_id
-        return -1;
+	if (sem_id < 0 || sem_id >= MAXSEMS) return -1; // validate sem_id
 
-    for (i = 0; i < MAXSEMS; i++) // find the semaphore with the given sem_id
+	for (i = 0; i < MAXSEMS; i++) // find the semaphore with the given sem_id
     {
-        if (semTable[i].sem_id == sem_id) // if we found the semaphore with the given sem_id
+		if (semTable[i].sem_id == sem_id) // found target semaphore
         {
-            sem_idx = i;
-            if (semTable[i].count > 0) // if the count is greater than 0, we can decrement it and proceed
+			sem_idx = i; // save the index of the target semaphore for later use in checking if we were woken up because the semaphore was freed while we were asleep
+			if (semTable[i].count > 0) // if the count is greater than 0, we can acquire the semaphore without blocking
             {
-                semTable[i].count--; // decrement the count to indicate we are using one unit of the semaphore
-                result = 0; // set result to 0 to indicate success
+                semTable[i].count--; // We got the semaphore
+				result = 0; // indicate success
             }
             else
             {
-                /* Enqueue this process's pid into the semaphore's wait queue before blocking */
-                int myPid = k_getpid();
-                semTable[i].waitQueue[semTable[i].waitTail] = myPid; // store our pid at the tail of the wait queue
-                semTable[i].waitTail = (semTable[i].waitTail + 1) % MAXPROC; // advance the tail index, wrapping around if necessary
+                
+				int myPid = k_getpid(); // get our pid to add to the wait queue for this semaphore and to know which mailbox to block on
+				semTable[i].waitQueue[semTable[i].waitTail] = myPid; // add to the wait queue for this semaphore at the tail index
+                semTable[i].waitTail = (semTable[i].waitTail + 1) % MAXPROC; // update the tail index for the wait queue
                 semTable[i].waitCount++; // increment the count of blocked processes
 
-                block(STATUS_WAIT_BLOCKED); // block this process until the semaphore is available.
+                
+				mailbox_receive(userProcTable[myPid % MAXPROC].mboxSem, NULL, 0, TRUE); // block on our mboxSem mailbox until we are woken up by the semv_syscall_handler when this semaphore becomes available
 
-                /* After being unblocked, check if the semaphore still exists.
-                   If not, it was freed while we were waiting. */
-                if (sem_idx == -1 || semTable[sem_idx].status == STATUS_EMPTY || semTable[sem_idx].sem_id != sem_id)
+				if (semTable[sem_idx].status == STATUS_EMPTY || semTable[sem_idx].sem_id != sem_id) // check if the semaphore we were waiting on was freed while we were asleep 
                 {
-                    result = -1; // The semaphore was freed.
+                    result = -1; // The semaphore was freed while we were asleep
                 }
-                else if (signaled()) // if we were signaled while blocked, then we should return -1 to indicate an error
-                    result = -1;
+                else if (signaled())
+                {
+                    result = -1; // We were killed while asleep
+                }
                 else
-                    result = 0;
+                {
+                    result = 0; // Successfully acquired!
+                }
             }
             break;
         }
@@ -216,28 +229,30 @@ int k_semp(int sem_id)
     return result;
 }
 
-int k_semv(int sem_id) // V operation on the semaphore with the given sem_id
+int k_semv(int sem_id)
 {
     int i;
     int result = -1;
 
-    if (sem_id < 0 || sem_id >= MAXSEMS) // validate sem_id 
-        return -1;
+	if (sem_id < 0 || sem_id >= MAXSEMS) return -1; // validate sem_id
 
-    for (i = 0; i < MAXSEMS; i++)
+	for (i = 0; i < MAXSEMS; i++) // find the semaphore with the given sem_id
     {
-        if (semTable[i].sem_id == sem_id) // if we found the semaphore with the given sem_id
+        if (semTable[i].sem_id == sem_id)
         {
-            if (semTable[i].waitCount > 0) // if there is a process blocked on this semaphore, wake it up instead of incrementing the count
+            if (semTable[i].waitCount > 0)
             {
-                int pidToUnblock = semTable[i].waitQueue[semTable[i].waitHead]; // get the pid of the process at the front of the wait queue
-                semTable[i].waitHead = (semTable[i].waitHead + 1) % MAXPROC; // advance the head index, wrapping around if necessary
-                semTable[i].waitCount--; // decrement the count of blocked processes
-                unblock(pidToUnblock); // wake up the blocked process so it can proceed past its block() call
+                
+				int pidToUnblock = semTable[i].waitQueue[semTable[i].waitHead]; // get the pid of the process at the head of the wait queue for this semaphore, which is the next process to unblock
+				semTable[i].waitHead = (semTable[i].waitHead + 1) % MAXPROC; // update the head index for the wait queue
+				semTable[i].waitCount--; // decrement the count of blocked processes
+
+               
+				mailbox_send(userProcTable[pidToUnblock % MAXPROC].mboxSem, NULL, 0, FALSE); // send a message to the mboxSem mailbox for this process to wake it up. This will unblock the process that was blocked in k_semp waiting for this semaphore.
             }
             else
             {
-                semTable[i].count++; // no blocked processes -- increment the count to indicate we are releasing one unit of the semaphore
+				semTable[i].count++; // if there are no processes waiting, just increment the count for this semaphore to indicate it is available. 
             }
             result = 0;
             break;
@@ -275,32 +290,40 @@ int k_semfree(int sem_id)
 {
     int i;
     int result = -1;
-    int unblockedCount = 0;
+    int hadBlocked = 0;
+
+    if (sem_id < 0 || sem_id >= MAXSEMS)
+        return -1;
 
     for (i = 0; i < MAXSEMS; i++) // find the semaphore with the given sem_id
     {
-        if (semTable[i].sem_id == sem_id) // if we found the semaphore with the given sem_id
+        if (semTable[i].sem_id == sem_id) // found target semaphore
         {
-            /* Unblock any processes still waiting on this semaphore before freeing it */
-            while (semTable[i].waitCount > 0)
+           
+			while (semTable[i].waitCount > 0)// if there are any processes blocked on this semaphore, unblock all of them and set hadBlocked to 1 to indicate that we unblocked at least one process
             {
-                int pidToUnblock = semTable[i].waitQueue[semTable[i].waitHead]; // get the pid of the process at the front of the wait queue
-                semTable[i].waitHead = (semTable[i].waitHead + 1) % MAXPROC; // advance the head index
-                semTable[i].waitCount--; // decrement the count of blocked processes
-                unblock(pidToUnblock); // wake up the blocked process; it will detect signaled() or check the result
-                unblockedCount++;
+				int pidToUnblock = semTable[i].waitQueue[semTable[i].waitHead]; // get the pid of the process at the head of the wait queue for this semaphore, which is the next process to unblock
+				semTable[i].waitHead = (semTable[i].waitHead + 1) % MAXPROC; // update the head index for the wait queue
+				semTable[i].waitCount--; // decrement the count of blocked processes
+
+                
+				mailbox_send(userProcTable[pidToUnblock % MAXPROC].mboxSem, NULL, 0, FALSE); // send a message to the mboxSem mailbox for this process to wake it up. This will unblock the process that was blocked in k_semp waiting for this semaphore.
+				hadBlocked = 1; // set hadBlocked to 1 to indicate that we unblocked at least one process
             }
 
-            semTable[i].sem_id = -1; // set sem_id to -1 to indicate this entry is not in use
-            semTable[i].count = 0; // reset count to 0
-            semTable[i].waitHead = 0; // reset wait queue head index
-            semTable[i].waitTail = 0; // reset wait queue tail index
-            semTable[i].waitCount = 0; // reset count of blocked processes
-            semTable[i].status = STATUS_EMPTY; // set status to STATUS_EMPTY to indicate this entry is empty
-            result = unblockedCount;
+			semTable[i].sem_id = -1; // set sem_id to -1 to indicate this entry is not in use
+			semTable[i].count = 0; // reset count to 0 for cleanliness, even though it shouldn't matter since this entry is now marked as empty
+			semTable[i].waitHead = 0; // reset wait queue head index to 0 for cleanliness, even though it shouldn't matter since this entry is now marked as empty
+			semTable[i].waitTail = 0; // reset wait queue tail index to 0 for cleanliness, even though it shouldn't matter since this entry is now marked as empty
+			semTable[i].waitCount = 0; // reset count of blocked processes to 0 for cleanliness, even though it shouldn't matter since this entry is now marked as empty
+            semTable[i].status = STATUS_EMPTY;
+
+            /* Test convention: 1 if any waiters were released, else 0 */
+            result = hadBlocked ? 1 : 0;
             break;
         }
     }
+
     return result;
 }
 
@@ -308,114 +331,103 @@ int sys_spawn(char* name, int (*startFunc)(char*), char* arg, int stackSize, int
 {
     int parentPid;
     int pid = -1;
-    int procSlot; // index of the slot in the userProcTable for this new process
     UserProcess* pProcess;
     UserProcess* pParent;
 
-    /* validate the parameters */
-    if (name == NULL || startFunc == NULL || stackSize < THREADS_MIN_STACK_SIZE || priority < LOWEST_PRIORITY || priority > HIGHEST_PRIORITY) // validate parameters and return -1 if any are invalid
+    
+	if (name == NULL || startFunc == NULL || stackSize < THREADS_MIN_STACK_SIZE || priority < LOWEST_PRIORITY || priority > HIGHEST_PRIORITY) // check for null pointers and validate stack size and priority
     {
         return -1;
     }
 
-    k_semp(procTableSem);
-
-    /* we are the parent*/
     parentPid = k_getpid();
 
-    procSlot = findFreeProcSlot(); // find a free slot in the userProcTable for this new process
-    if (procSlot < 0)
+    
+	pid = k_spawn(name, launchUserProcess, arg, stackSize, priority); // spawn a new process to run the launchUserProcess function, which will wait for the startup message from this sys_spawn function before executing the user function specified by startFunc.
+
+	if (pid < 0) // if k_spawn failed to create the new process, return -1 to indicate failure
     {
-        console_output(FALSE, "sys_spawn(): no free process slots.\n");
-        k_semv(procTableSem);
+        console_output(FALSE, "Failed to create user process.");
         return -1;
     }
 
-    pProcess = &userProcTable[procSlot]; // get a pointer to the UserProcess struct for this new process using the procSlot index
+   
+	mailbox_send(procTableMutex, NULL, 0, TRUE); // acquire mutex for process table to safely update the PCB for the new process and add it to the children list of the parent process
+     
+	pProcess = &userProcTable[pid % MAXPROC]; // find the UserProcess struct for the new process
 
-    pid = k_spawn(name, launchUserProcess, arg, stackSize, priority);
-    if (pid < 0)
+   
+	pProcess->pid = pid; // set the pid for this process in its PCB
+	pProcess->startFunc = startFunc; // set the startFunc for this process in its PCB to the function specified by the caller of sys_spawn, which will be called by launchUserProcess 
+	pProcess->arg = arg; // set the arg for this process in its PCB to the argument specified by the caller of sys_spawn, which will be passed to startFunc when launchUserProcess calls it
+	pProcess->parentPid = parentPid; // set the parentPid for this process in its PCB to the pid of the parent process, which we got at the beginning of this function. 
+    pProcess->status = STATUS_READY;
+
+	TListInitialize(&pProcess->children, offsetof(UserProcess, pNextSibling), NULL); // initialize the children list for this process
+
+   
+    if (parentPid > 0) // Prevents issues if the very first process has no parent
     {
-        console_output(FALSE, "Failed to create user process.");
-        memset(pProcess, 0, sizeof(UserProcess)); // reset the UserProcess struct for this new process to clear out any data we set
-        /* Restore a valid (empty) children list after the memset so the slot
-           remains safe even before it is reused. */
-        TListInitialize(&pProcess->children,
-            offsetof(UserProcess, pNextSibling),
-            NULL);
-    }
-    else
-    {
-        pProcess->pid = pid; // set the pid for this new process to the pid returned from k_spawn
-        pProcess->startFunc = startFunc; // set the startFunc for this new process to the startFunc parameter
-        pProcess->arg = arg; // set the arg for this new process to the arg parameter
-        pProcess->parentPid = parentPid; // set the parentPid for this new process to the pid of the parent process
-        pProcess->status = STATUS_READY; // set the status for this new process to STATUS_READY to indicate it is ready to run.
-
-        /* Re-initialize the children list for this slot. The slot may have been
-           used by a previous process whose exit zeroed the struct via memset. */
-        TListInitialize(&pProcess->children,
-            offsetof(UserProcess, pNextSibling), // pNextSibling/pPrevSibling are the link fields for the children list
-            NULL); // no ordering function -- children are kept in insertion order
-
-        /* Register the new process as a child of the parent */
-        pParent = findProcByPid(parentPid);
-        if (pParent != NULL)
-        {
-            TListAddNode(&pParent->children, pProcess); // add the new process to the parent's list of children
-        }
+        pParent = &userProcTable[parentPid % MAXPROC];
+        TListAddNode(&pParent->children, pProcess);
     }
 
-    k_semv(procTableSem);
+   
+	mailbox_receive(procTableMutex, NULL, 0, FALSE); // release mutex for process table now that we're done updating the PCB for the new process and adding it to the children list of the parent process
+
+	mailbox_send(pProcess->mboxStartup, NULL, 0, FALSE); // send the startup message to the mboxStartup mailbox for this process to allow it to proceed with executing its startFunc now that the PCB is fully set up
+
     return pid;
 }
 
 int sys_wait(int* pStatus)
 {
     int pid;
-    pid = k_wait(pStatus);
+	pid = k_wait(pStatus); // call k_wait to wait for a child process to finish and get its exit status. k_wait will return the pid of the child that finished, or -1 if there are no children to wait for.
     return pid;
 }
 
 void sys_exit(int resultCode)
 {
-    int pid = k_getpid();
-    UserProcess* pProcess;
+    int pid;
+	UserProcess* pProcess; // pointer to the UserProcess struct for this process
+	int childStatus;// variable to store the exit status of child processes when we wait for them to finish
 
-    pProcess = findProcByPid(pid); // find the correct slot by searching, not by pid % MAXPROC
+	pid = k_getpid(); // get our pid to find our PCB and to know which mailbox to use for mutual exclusion
+	pProcess = findProcByPid(pid); // find the UserProcess struct for this process using its pid. 
     if (pProcess == NULL)
     {
-        k_exit(resultCode); // no entry found -- just exit at the kernel level
+        k_exit(resultCode);
         return;
     }
 
-
+    /* Signal all children to terminate, but keep them in the children list */
     {
         UserProcess* pChild = (UserProcess*)TListGetNextNode(&pProcess->children, NULL);
-        UserProcess* pInitProc = findProcByPid(1); // Find the init process
         while (pChild != NULL)
         {
-            UserProcess* pNext = (UserProcess*)TListGetNextNode(&pProcess->children, pChild); // snapshot next before any mutation
-            if (pChild->pid > 0) // only work on children that are still alive
+            if (pChild->pid > 0)
             {
-                TListRemoveNode(&pProcess->children, pChild);
-                pChild->parentPid = 1; // Reparent to init process
-                if (pInitProc != NULL)
-                {
-                    TListAddNode(&pInitProc->children, pChild);
-                }
+                
+				k_kill(pChild->pid, SIG_TERM); // send a termination signal to the child process to ask it to terminate.
             }
-            pChild = pNext;
+			pChild = (UserProcess*)TListGetNextNode(&pProcess->children, pChild); // get the next child in the list
         }
     }
 
-
-    if (pProcess->parentPid != 0) // if this process has a parent (parentPid of 0 indicates no parent)
+    
+	while (TListGetNextNode(&pProcess->children, NULL) != NULL) // keep waiting until there are no more children in the children list
     {
-        UserProcess* pParent = findProcByPid(pProcess->parentPid); // find the UserProcess struct for the parent process
-        if (pParent != NULL) // if we found the parent process
+		k_wait(&childStatus); // wait for a child process to finish. 
+        
+    }
+
+	if (pProcess->parentPid != 0) // if this process has a parent, remove this process from its parent's children list
+    {
+		UserProcess* pParent = findProcByPid(pProcess->parentPid); // find the UserProcess struct for the parent process using the parentPid field in this process's PCB. 
+        if (pParent != NULL)
         {
-            TListRemoveNode(&pParent->children, pProcess); // remove this process from the parent's children list
+			TListRemoveNode(&pParent->children, pProcess); // remove this process from its parent's children list 
         }
     }
 
@@ -513,15 +525,16 @@ static void semv_syscall_handler(system_call_arguments_t* args) // handler for t
 
 static void semfree_syscall_handler(system_call_arguments_t* args) // handler for the SYS_SEMFREE system call
 {
-    int sem_id = (int)args->arguments[0]; // cast the first argument to an int for the semaphore handle
+    int sem_id = (int)args->arguments[0];
     int result;
 
-    result = k_semfree(sem_id); // free the semaphore with the given sem_id
+	result = k_semfree(sem_id); // free the semaphore with the given sem_id
 
-    args->arguments[0] = (intptr_t)result; // return the number of unblocked processes to the caller
-    args->arguments[3] = (intptr_t)(result < 0 ? -1 : 0); // return 0 on success, -1 on failure
+    
+	args->arguments[0] = (intptr_t)result;// return the result code from k_semfree (1 if any waiters were released, 0 if no waiters were released, -1 on failure)
+    args->arguments[3] = (intptr_t)result; 
 
-    set_psr(get_psr() & ~PSR_KERNEL_MODE); // restore user mode before returning
+    set_psr(get_psr() & ~PSR_KERNEL_MODE);
 }
 
 static void getpid_syscall_handler(system_call_arguments_t* args) // handler for the SYS_GETPID system call
@@ -531,28 +544,15 @@ static void getpid_syscall_handler(system_call_arguments_t* args) // handler for
     set_psr(get_psr() & ~PSR_KERNEL_MODE); // restore user mode before returning
 }
 
-static void gettimeofday_syscall_handler(system_call_arguments_t* args) // handler for the SYS_GETTIMEOFDAY system call
+static void gettimeofday_syscall_handler(system_call_arguments_t* args)
 {
-    // For demonstration, we'll just return a dummy value that changes every second.
-    // A real implementation would query the system time and populate the timeval struct accordingly.
-
-    struct timeval {
-        long tv_sec;     /* seconds */
-        long tv_usec;    /* microseconds */
-    } tval;
-
-    tval.tv_sec = k_getpid();  // Dummy: using pid as seconds since epoch (definitely not correct!)
-    tval.tv_usec = (k_getpid() % 1000) * 1000;  // Dummy: using pid modulo 1000 as microseconds
-
-    args->arguments[0] = (intptr_t)&tval; // return the pointer to the timeval struct to the caller
-
-    set_psr(get_psr() & ~PSR_KERNEL_MODE); // restore user mode before returning
+	args->arguments[0] = (intptr_t)system_clock(); // return the current system time to the caller. 
+    set_psr(get_psr() & ~PSR_KERNEL_MODE);
 }
 
 static void cputime_syscall_handler(system_call_arguments_t* args) // handler for the SYS_CPUTIME system call
 {
-    // For demonstration, we'll just return a dummy CPU time.
-    // A real implementation would return the actual CPU time used by the process.
+  
 
     args->arguments[0] = (intptr_t)(k_getpid() * 100 + 50); // Dummy: some calculations based on pid
 
